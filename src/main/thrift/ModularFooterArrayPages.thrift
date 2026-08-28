@@ -147,35 +147,50 @@ struct MetadataPageHeader {
 
 /** Locates one complete [MetadataPageHeader][payload] record. */
 struct MetadataPageLocation {
-  1: required MetadataModule module,
-  2: required MetadataArray array,
-  3: required MetadataPageScope scope,
-  4: optional i32 column_ordinal,
-  5: optional i32 row_group_ordinal,
-  6: required i64 offset,
+  1: required MetadataArray array,
+  2: required MetadataPageScope scope,
+  3: optional i32 column_ordinal,
+  4: optional i32 row_group_ordinal,
+  5: required i64 offset,
   /** Header plus payload bytes. */
-  7: required i32 length
+  6: required i32 length
 }
 
-/** Ordinary compact-Thrift structures that are read in full remain separate modules. */
-enum ThriftMetadataModule {
-  SCHEMA = 0,
-  FILE_METADATA = 1
+/** Physical representation of an independently located module. */
+enum MetadataModuleEncoding {
+  /** The module is one ordinary compact-Thrift structure read in full. */
+  THRIFT = 0,
+  /** The module is a compact-Thrift MetadataModuleHeader that locates raw array pages. */
+  ARRAY_PAGES = 1
 }
 
-/** Absolute location of one independently serialized ordinary Thrift module. */
-struct ThriftModuleLocation {
-  1: required ThriftMetadataModule module,
-  2: required i64 offset,
-  3: required i64 length
+/**
+ * Descriptor for one ARRAY_PAGES module. It is independently compact-Thrift serialized at the
+ * location named by MetadataModuleLocation. Its page locations do not appear in the footer root.
+ *
+ * For OFFSET_INDEX and COLUMN_INDEX, pages contains only the FILE-scoped PAGE_GROUP_OFFSET page.
+ * The per-column-chunk pages are found through that page's offsets.
+ */
+struct MetadataModuleHeader {
+  1: required MetadataModule module,
+  2: required list<MetadataPageLocation> pages
+}
+
+/** Absolute location of one independently serialized module or module descriptor. */
+struct MetadataModuleLocation {
+  1: required MetadataModule module,
+  2: required MetadataModuleEncoding encoding,
+  3: required i64 offset,
+  4: required i64 length
 }
 
 /**
  * The always-read root of an array-page modular footer.
  *
- * pages contains only FILE-scoped pages. In particular, it contains at most one
- * PAGE_GROUP_OFFSET page for OFFSET_INDEX and one for COLUMN_INDEX. It MUST NOT expand every
- * column chunk's page-index arrays into this root.
+ * modules contains one entry per present semantic module. SCHEMA and PLACEMENT are required;
+ * remaining modules are optional. A reader fetches and decodes a module descriptor only when that
+ * module's read lifecycle requires it. In particular, reading placement does not fetch the
+ * ROW_GROUP_STATS descriptor.
  *
  * A PAGE_GROUP_OFFSET payload has num_columns * num_row_groups + 1 dense UINT64 values in chunk
  * space. Entry k and k+1 delimit the absolute byte range containing the COLUMN_CHUNK-scoped
@@ -188,6 +203,5 @@ struct ModularFooterPageIndex {
   3: required i32 num_columns,
   4: required i64 num_rows,
   5: required list<i64> row_group_num_rows,
-  6: required list<MetadataPageLocation> pages,
-  7: optional list<ThriftModuleLocation> thrift_modules
+  6: required list<MetadataModuleLocation> modules
 }

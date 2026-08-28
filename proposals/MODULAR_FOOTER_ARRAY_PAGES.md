@@ -196,24 +196,41 @@ struct MetadataPageHeader {
 
 /** Locates one complete [MetadataPageHeader][payload] record. */
 struct MetadataPageLocation {
-  1: required ModularFooterModule module;
-  2: required MetadataArray array;
-  3: required i64 offset;
+  1: required MetadataArray array;
+  2: required MetadataPageScope scope;
+  /** Required exactly when scope is COLUMN_CHUNK. */
+  3: optional i32 column_ordinal;
+  /** Required exactly when scope is COLUMN_CHUNK. */
+  4: optional i32 row_group_ordinal;
+  5: required i64 offset;
   /** Header plus payload bytes. */
-  4: required i32 length;
-  5: required MetadataPageScope scope;
-  /** Required exactly when scope is COLUMN_CHUNK. */
-  6: optional i32 column_ordinal;
-  /** Required exactly when scope is COLUMN_CHUNK. */
-  7: optional i32 row_group_ordinal;
+  6: required i32 length;
+}
+
+enum MetadataModuleEncoding {
+  THRIFT = 0;
+  ARRAY_PAGES = 1;
+}
+
+/** Compact-Thrift descriptor for one ARRAY_PAGES module. */
+struct MetadataModuleHeader {
+  1: required ModularFooterModule module;
+  2: required list<MetadataPageLocation> pages;
+}
+
+struct MetadataModuleLocation {
+  1: required ModularFooterModule module;
+  2: required MetadataModuleEncoding encoding;
+  3: required i64 offset;
+  4: required i64 length;
 }
 ```
 
-The page identity `(module, array, scope, column_ordinal, row_group_ordinal)` is repeated in the
-page header and directory deliberately. The directory can select a page without parsing it; the
-page remains self-describing and can validate that the directory did not address the wrong bytes.
-The two ordinals are absent for `FILE` pages. They are both present for `COLUMN_CHUNK` pages and
-identify the column chunk whose page-ordinal domain the payload describes.
+`MetadataPageLocation` belongs to a `MetadataModuleHeader`, so it does not repeat the module. The
+page header retains the module: the containing descriptor says what should be present, and the page
+confirms what was actually found. The two ordinals are absent for `FILE` pages. They are both
+present for `COLUMN_CHUNK` pages and identify the column chunk whose page-ordinal domain the payload
+describes.
 
 ## Common payload conventions
 
@@ -318,7 +335,7 @@ The modular footer retains its semantic module boundaries:
 * `OFFSET_INDEX` and `COLUMN_INDEX` are optional and remain independently addressable per column
   chunk. Each array has `COLUMN_CHUNK` scope and uses that chunk's data-page ordinals as its logical
   positions. Their many per-chunk pages are located through the two-level directory described
-  below; they are not expanded into the root directory.
+  below; they are not expanded into the module descriptor.
 * `FILE_METADATA` is read in full and MAY remain an ordinary compact-Thrift structure.
 
 The exact required placement arrays and their semantics remain those specified by the modular
@@ -330,9 +347,8 @@ bound without the other.
 
 ## Directory and footer framing
 
-`ModularFooter` contains the file-level scalars, locations of ordinary Thrift modules, and locations
-of file-scoped metadata pages. The root directory is small and is decoded in full. It MUST NOT
-contain one entry per column chunk.
+`ModularFooter` contains the file-level scalars and one location per present semantic module. Its
+root directory is small and decoded in full. It does not contain array-page locations.
 
 ```thrift
 struct ModularFooter {
@@ -341,17 +357,25 @@ struct ModularFooter {
   3: required i32 num_columns;
   4: required i64 num_rows;
   5: required list<i64> row_group_num_rows;
-  /** File-scoped pages, including placement, row-group stats, and page-group offset pages. */
-  6: required list<MetadataPageLocation> pages;
-  7: optional list<ModularFooterDirectoryEntry> thrift_modules;
+  6: required list<MetadataModuleLocation> modules;
 }
 ```
 
+For an `ARRAY_PAGES` entry, `offset` and `length` locate a compact-Thrift
+`MetadataModuleHeader`. That descriptor contains the module's `MetadataPageLocation` entries. For a
+`THRIFT` entry, they locate the ordinary compact-Thrift module payload directly. Schema and file
+metadata can therefore remain ordinary Thrift structures, while placement and statistics use array
+pages.
+
+`SCHEMA` and `PLACEMENT` are required module entries. Other entries are optional. A reader fetches a
+module descriptor only when the query needs that module: reading placement does not fetch or decode
+the row-group-statistics descriptor.
+
 ### Two-level directory for page indexes
 
-Expanding every offset-index and column-index array page into `ModularFooter.pages` would make the
-root proportional to `num_columns * num_row_groups`. Instead, each optional page-index module has
-one file-scoped `PAGE_GROUP_OFFSET` page in the root directory. Its dense `UINT64` payload contains
+Expanding every offset-index and column-index array page into its `MetadataModuleHeader` would make
+that descriptor proportional to `num_columns * num_row_groups`. Instead, each page-index module
+descriptor has one file-scoped `PAGE_GROUP_OFFSET` page. Its dense `UINT64` payload contains
 `num_columns * num_row_groups + 1` cumulative absolute file offsets in chunk-space order.
 
 For chunk index `k`, the half-open byte range
@@ -367,7 +391,7 @@ group end. Because each group has only the fields of one offset index or column 
 bounded by the module schema rather than table width.
 
 The `OFFSET_INDEX/PAGE_GROUP_OFFSET` and `COLUMN_INDEX/PAGE_GROUP_OFFSET` pages are distinct because
-their `module` values differ. Their own locations are ordinary entries in `ModularFooter.pages`.
+they belong to different module descriptors and their page headers carry different module values.
 
 This document does not change the outer mechanism that locates `ModularFooter` from the end of the
 file. Page and page-group offsets are absolute file offsets, allowing optional modules or large
@@ -381,11 +405,12 @@ and MUST NOT overlap unless a future version explicitly defines shared pages.
 
 To obtain placement for projected leaf column `c`, a reader:
 
-1. Reads the footer index and locates the required placement array pages.
-2. Computes the chunk-space range
+1. Reads the footer index and locates the placement module descriptor.
+2. Decodes that compact-Thrift descriptor and locates the required placement array pages.
+3. Computes the chunk-space range
    `[c * num_row_groups, (c + 1) * num_row_groups)`.
-3. Parses each selected page header.
-4. Uses the encoding-specific random-access operation for only that range.
+4. Parses each selected page header.
+5. Uses the encoding-specific random-access operation for only that range.
 
 No statistics page is required for this operation. A reader that performs row-group pruning locates
 the relevant statistics pages separately and looks up the same chunk-space positions.
@@ -416,8 +441,9 @@ Metadata-page framing does not add a separate compatibility break beyond that la
 
 A conforming reader MUST reject a modular footer when any of the following holds:
 
-* A required schema or placement array page is missing or duplicated.
-* A page's directory identity differs from its header identity.
+* A required schema or placement module is missing or duplicated.
+* A required placement array page is missing or duplicated in its module descriptor.
+* A page's descriptor identity differs from its header identity.
 * A page's scope and optional ordinals are inconsistent, or an ordinal is outside the file shape.
 * A page-group offset array has the wrong cardinality, is decreasing, or addresses bytes outside
   the file.
