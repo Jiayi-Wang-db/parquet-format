@@ -18,98 +18,41 @@
  */
 
 /**
- * Array-page physical encoding for the modular footer.
+ * Modular Footer: typed Thrift modules whose array fields point to raw encoded pages.
  *
- * A metadata page is encoded as:
+ * ArrayPage is both the location and header of an array payload. The payload at ArrayPage.offset
+ * contains exactly ArrayPage.length raw bytes; it is not a Thrift binary field and has no separate
+ * page header. The typed field containing ArrayPage defines the values' meaning, type, and logical
+ * domain. ArrayPage defines only their physical encoding.
  *
- *   [compact-Thrift MetadataPageHeader][raw payload]
+ * Modules preserve independent read lifecycles. A reader can fetch placement without fetching
+ * row-group statistics, and can fetch per-page indexes only for projected column chunks. Schema
+ * and descriptive file metadata remain ordinary Thrift data because readers consume them in full.
  *
- * The payload is not a Thrift binary field. It begins immediately after the
- * MetadataPageHeader STOP byte and has exactly payload_length bytes. Its layout is selected by
- * MetadataArrayEncoding, in the same way that a Parquet data page header selects the encoding of
- * the data page body.
- *
- * This file defines the page headers and the always-read footer index. The outer file framing that
- * locates ModularFooterPageIndex from the end of a file is specified separately.
+ * The outer file framing that locates ModularFooter from the end of a file is specified separately.
  */
 
 include "parquet.thrift"
 
-namespace cpp parquet.modular.page
-namespace java org.apache.parquet.format.modular.page
+namespace cpp parquet.modular
+namespace java org.apache.parquet.format.modular
 
-/** Modules preserve independent read lifecycles; pages never combine modules. */
-enum MetadataModule {
-  SCHEMA = 0,
-  PLACEMENT = 1,
-  ROW_GROUP_STATS = 2,
-  OFFSET_INDEX = 3,
-  COLUMN_INDEX = 4,
-  FILE_METADATA = 5
-}
-
-/**
- * Stable semantic identifiers for metadata arrays. Numeric values MUST NOT be reused for a
- * different meaning.
- */
-enum MetadataArray {
-  DATA_PAGE_OFFSET = 0,
-  FIRST_DICTIONARY_PAGE = 1,
-  DICTIONARY_PAGE_OFFSET = 2,
-  TOTAL_COMPRESSED_SIZE = 3,
-  TOTAL_UNCOMPRESSED_SIZE = 4,
-  NUM_VALUES = 5,
-  CODEC = 6,
-  PHYSICAL_TYPE = 7,
-  IS_FULLY_DICTIONARY_ENCODED = 8,
-
-  NULL_COUNT = 20,
-  MIN_VALUE = 21,
-  MAX_VALUE = 22,
-  MIN_IS_EXACT = 23,
-  MAX_IS_EXACT = 24,
-  NAN_COUNT = 25,
-
-  PAGE_OFFSET = 40,
-  COMPRESSED_PAGE_SIZE = 41,
-  FIRST_ROW_INDEX = 42,
-  NULL_PAGE = 43,
-  BOUNDARY_ORDER = 44,
-
-  /** Cumulative absolute offsets of per-column-chunk metadata page groups. */
-  PAGE_GROUP_OFFSET = 45
-}
-
-/** Logical type of each value exposed by a decoded metadata page. */
-enum MetadataValueType {
-  BOOLEAN = 0,
-  UINT32 = 1,
-  UINT64 = 2,
-  BYTE_ARRAY = 3
-}
-
-/** Initial raw payload encodings. Neither applies general-purpose compression. */
-enum MetadataArrayEncoding {
+/** Initial raw array encodings. Neither applies general-purpose compression. */
+enum ArrayEncoding {
+  /** Dense fixed-width values, one value at every logical position. */
   BIT_PACKED = 0,
+  /** Sorted present positions followed by their fixed-width values. */
   SPARSE = 1
 }
 
-/** The logical domain in which page positions are interpreted. */
-enum MetadataPageScope {
-  /** File-wide chunk space, column space, or another array-defined domain. */
-  FILE = 0,
-  /** Data-page ordinals within one (leaf column, row group) column chunk. */
-  COLUMN_CHUNK = 1
-}
-
 /** Parameters for a dense BIT_PACKED payload. */
-struct BitPackedEncodingHeader {
+struct BitPackedParameters {
   /** Width of each integer value, or each BYTE_ARRAY cumulative offset, in bits. */
   1: required i8 bit_width
 }
 
 /** Parameters for a SPARSE payload. */
-struct SparseEncodingHeader {
+struct SparseParameters {
   /** Number of logical positions that have a value. */
   1: required i32 num_present,
   /** Width of each entry in the sorted logical-position stream, in bits. */
@@ -118,42 +61,32 @@ struct SparseEncodingHeader {
   3: required i8 value_bit_width
 }
 
-/** Exactly one member MUST be set, matching MetadataPageHeader.encoding. */
-union MetadataEncodingHeader {
-  1: BitPackedEncodingHeader bit_packed,
-  2: SparseEncodingHeader sparse
+/** Exactly one member MUST be set, matching ArrayPage.encoding. */
+union ArrayEncodingParameters {
+  1: BitPackedParameters bit_packed,
+  2: SparseParameters sparse
 }
 
 /**
- * Compact-Thrift header immediately followed by raw payload bytes.
+ * Descriptor for one raw array payload.
  *
- * FILE pages omit column_ordinal and row_group_ordinal. COLUMN_CHUNK pages MUST carry both. The
- * latter identify the column chunk whose data-page ordinals form this page's logical domain.
+ * The payload begins at the absolute file offset and contains exactly length bytes. Its decoded
+ * cardinality is num_values, including absent logical positions under SPARSE. The containing typed
+ * module field defines whether values are BOOLEAN, UINT32, UINT64, or BYTE_ARRAY and defines the
+ * logical indexing domain.
  */
-struct MetadataPageHeader {
-  1: required MetadataModule module,
-  2: required MetadataArray array,
-  3: required MetadataValueType value_type,
-  4: required MetadataArrayEncoding encoding,
-  /** Addressable positions, including absent positions under SPARSE. */
-  5: required i32 num_values,
-  /** Raw bytes immediately following this struct's STOP byte. */
-  6: required i32 payload_length,
-  7: required MetadataEncodingHeader encoding_header,
-  8: required MetadataPageScope scope,
-  9: optional i32 column_ordinal,
-  10: optional i32 row_group_ordinal
+struct ArrayPage {
+  1: required i64 offset,
+  2: required i32 length,
+  3: required ArrayEncoding encoding,
+  4: required i32 num_values,
+  5: required ArrayEncodingParameters parameters
 }
 
-/** Locates one complete [MetadataPageHeader][payload] record. */
-struct MetadataPageLocation {
-  1: required MetadataArray array,
-  2: required MetadataPageScope scope,
-  3: optional i32 column_ordinal,
-  4: optional i32 row_group_ordinal,
-  5: required i64 offset,
-  /** Header plus payload bytes. */
-  6: required i32 length
+/** Absolute location of one independently compact-Thrift serialized module. */
+struct ModuleLocation {
+  1: required i64 offset,
+  2: required i64 length
 }
 
 /** Schema is tree-shaped and read in full, so it remains ordinary Thrift data. */
@@ -162,66 +95,125 @@ struct SchemaModule {
   2: optional list<parquet.ColumnOrder> column_orders
 }
 
-/** Descriptive file metadata is read in full, so it remains ordinary Thrift data. */
+/**
+ * Placement for every column chunk.
+ *
+ * Unless noted otherwise, pages contain num_columns * num_row_groups UINT64 values in column-major
+ * chunk space: chunk (column c, row group g) is at c * num_row_groups + g. These required arrays
+ * use BIT_PACKED because every column chunk has a value.
+ */
+struct PlacementModule {
+  /** UINT64: first data-page byte offset. */
+  1: required ArrayPage data_page_offsets,
+  /** UINT64: num_chunks + 1 cumulative indexes into dictionary_page_offsets. */
+  2: required ArrayPage first_dictionary_pages,
+  /** UINT64: flattened byte offsets of all dictionary pages. */
+  3: required ArrayPage dictionary_page_offsets,
+  /** UINT64: total compressed bytes in each column chunk. */
+  4: required ArrayPage total_compressed_sizes,
+  /** UINT64: total uncompressed bytes in each column chunk. */
+  5: required ArrayPage total_uncompressed_sizes,
+  /** UINT64: value count in each column chunk. */
+  6: required ArrayPage num_values,
+  /** UINT32: parquet.CompressionCodec value for each column chunk. */
+  7: required ArrayPage codecs,
+  /** UINT32: parquet.Type value; num_columns entries, one per leaf column. */
+  8: required ArrayPage physical_types,
+  /** BOOLEAN: true when every data page in the column chunk is dictionary encoded. */
+  9: required ArrayPage is_fully_dictionary_encoded
+}
+
+/** Row-group statistics for one leaf column; array positions are row-group ordinals. */
+struct ColumnStatistics {
+  /** UINT64: optional null count for each row group. */
+  1: optional ArrayPage null_counts,
+  /** BYTE_ARRAY: optional encoded minimum for each row group. */
+  2: optional ArrayPage min_values,
+  /** BYTE_ARRAY: optional encoded maximum for each row group. */
+  3: optional ArrayPage max_values,
+  /** BOOLEAN: exactness for each present minimum. */
+  4: optional ArrayPage min_is_exact,
+  /** BOOLEAN: exactness for each present maximum. */
+  5: optional ArrayPage max_is_exact,
+  /** UINT64: optional NaN count. */
+  6: optional ArrayPage nan_counts
+}
+
+/**
+ * Directory of independently serialized ColumnStatistics descriptors.
+ *
+ * column_offsets contains num_columns + 1 dense UINT64 absolute file offsets. Entries c and c+1
+ * delimit the descriptor for leaf column c. Equal offsets mean that the column has no row-group
+ * statistics. A per-column encryption envelope may cover the descriptor and all of its array-page
+ * payloads so one column key protects the column's statistics as a unit.
+ */
+struct RowGroupStatisticsModule {
+  1: required ArrayPage column_offsets
+}
+
+/**
+ * Per-page placement for one (leaf column, row group) column chunk. Array pages use that column
+ * chunk's data-page ordinal as their logical position.
+ */
+struct OffsetIndexChunk {
+  /** UINT64: page byte offset. */
+  1: required ArrayPage offsets,
+  /** UINT32: compressed page bytes including its page header. */
+  2: required ArrayPage compressed_page_sizes,
+  /** UINT64: first row index within the row group. */
+  3: required ArrayPage first_row_indexes
+}
+
+/** Per-page statistics for one (leaf column, row group) column chunk. */
+struct ColumnIndexChunk {
+  1: required parquet.BoundaryOrder boundary_order,
+  /** BOOLEAN: true when the page contains only null values. */
+  2: required ArrayPage null_pages,
+  /** UINT64: optional null count. */
+  3: optional ArrayPage null_counts,
+  /** BYTE_ARRAY: encoded minimum; paired with max_values. */
+  4: optional ArrayPage min_values,
+  /** BYTE_ARRAY: encoded maximum; paired with min_values. */
+  5: optional ArrayPage max_values,
+  /** BOOLEAN: exactness for each present minimum. */
+  6: optional ArrayPage min_is_exact,
+  /** BOOLEAN: exactness for each present maximum. */
+  7: optional ArrayPage max_is_exact,
+  /** UINT64: optional NaN count. */
+  8: optional ArrayPage nan_counts
+}
+
+/**
+ * Directory for independently serialized per-column-chunk index descriptors.
+ *
+ * chunk_offsets contains num_columns * num_row_groups + 1 dense UINT64 absolute file offsets in
+ * column-major chunk space. Entries k and k+1 delimit one compact-Thrift OffsetIndexChunk or
+ * ColumnIndexChunk. Equal offsets mean that the chunk has no corresponding index.
+ */
+struct PageIndexModule {
+  1: required ArrayPage chunk_offsets
+}
+
+/** Descriptive metadata is read in full, so it remains ordinary Thrift data. */
 struct FileMetadataModule {
   1: optional string created_by,
   2: optional list<parquet.KeyValue> key_value_metadata
 }
 
-/** Physical representation of an independently located module. */
-enum MetadataModuleEncoding {
-  /** The module is one ordinary compact-Thrift structure read in full. */
-  THRIFT = 0,
-  /** The module is a compact-Thrift MetadataModuleHeader that locates raw array pages. */
-  ARRAY_PAGES = 1
-}
-
 /**
- * Lightweight descriptor for one ARRAY_PAGES module. The actual metadata values are in the raw
- * page payloads, not fields of this struct. The descriptor is independently compact-Thrift
- * serialized at the location named by MetadataModuleLocation. Its page locations do not appear in
- * the footer root.
- *
- * For OFFSET_INDEX and COLUMN_INDEX, pages contains only the FILE-scoped PAGE_GROUP_OFFSET page.
- * The per-column-chunk pages are found through that page's offsets.
+ * The always-read root. Locations point to independently compact-Thrift serialized typed modules.
+ * Schema and placement are required; the remaining modules are optional.
  */
-struct MetadataModuleHeader {
-  1: required MetadataModule module,
-  /** Defines the required pages and their semantics for this module. */
-  2: required i32 version,
-  3: required list<MetadataPageLocation> pages
-}
-
-/** Absolute location of one independently serialized module or module descriptor. */
-struct MetadataModuleLocation {
-  1: required MetadataModule module,
-  /**
-   * SCHEMA and FILE_METADATA may use THRIFT. PLACEMENT, ROW_GROUP_STATS, OFFSET_INDEX, and
-   * COLUMN_INDEX use ARRAY_PAGES so their values remain independently addressable.
-   */
-  2: required MetadataModuleEncoding encoding,
-  3: required i64 offset,
-  4: required i64 length
-}
-
-/**
- * The always-read root of an array-page modular footer.
- *
- * modules contains one entry per present semantic module. SCHEMA and PLACEMENT are required;
- * remaining modules are optional. A reader fetches and decodes a module descriptor only when that
- * module's read lifecycle requires it. In particular, reading placement does not fetch the
- * ROW_GROUP_STATS descriptor.
- *
- * A PAGE_GROUP_OFFSET payload has num_columns * num_row_groups + 1 dense UINT64 values in chunk
- * space. Entry k and k+1 delimit the absolute byte range containing the COLUMN_CHUNK-scoped
- * metadata pages for chunk k. Equal offsets mean that the chunk has no index. Pages within a
- * nonempty group are concatenated in ascending MetadataArray order.
- */
-struct ModularFooterPageIndex {
+struct ModularFooter {
   1: required i32 version,
   2: required i32 num_row_groups,
   3: required i32 num_columns,
   4: required i64 num_rows,
   5: required list<i64> row_group_num_rows,
-  6: required list<MetadataModuleLocation> modules
+  6: required ModuleLocation schema,
+  7: required ModuleLocation placement,
+  8: optional ModuleLocation row_group_statistics,
+  9: optional ModuleLocation offset_index,
+  10: optional ModuleLocation column_index,
+  11: optional ModuleLocation file_metadata
 }
