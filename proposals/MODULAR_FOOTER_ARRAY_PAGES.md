@@ -37,7 +37,7 @@ array is stored as an independently framed **metadata page**:
 ```
 
 The normative Thrift definitions are in
-[`ModularFooterArrayPages.thrift`](../src/main/thrift/ModularFooterArrayPages.thrift).
+[`ModularFooter.thrift`](../src/main/thrift/ModularFooter.thrift).
 
 The payload is not a Thrift `binary` field. The header identifies its meaning, value type,
 encoding, logical cardinality, and byte length. A footer directory locates metadata pages by file
@@ -94,7 +94,7 @@ The following definitions are added to `ModularFooter.thrift`.
 
 ```thrift
 /** The semantic module to which an array page belongs. */
-enum ModularFooterModule {
+enum MetadataModule {
   SCHEMA = 0;
   PLACEMENT = 1;
   ROW_GROUP_STATS = 2;
@@ -178,7 +178,7 @@ union MetadataEncodingHeader {
  * struct STOP byte and occupies exactly payload_length bytes. It is not a Thrift binary value.
  */
 struct MetadataPageHeader {
-  1: required ModularFooterModule module;
+  1: required MetadataModule module;
   2: required MetadataArray array;
   3: required MetadataValueType value_type;
   4: required MetadataArrayEncoding encoding;
@@ -214,12 +214,13 @@ enum MetadataModuleEncoding {
 
 /** Compact-Thrift descriptor for one ARRAY_PAGES module. */
 struct MetadataModuleHeader {
-  1: required ModularFooterModule module;
-  2: required list<MetadataPageLocation> pages;
+  1: required MetadataModule module;
+  2: required i32 version;
+  3: required list<MetadataPageLocation> pages;
 }
 
 struct MetadataModuleLocation {
-  1: required ModularFooterModule module;
+  1: required MetadataModule module;
   2: required MetadataModuleEncoding encoding;
   3: required i64 offset;
   4: required i64 length;
@@ -231,6 +232,11 @@ page header retains the module: the containing descriptor says what should be pr
 confirms what was actually found. The two ordinals are absent for `FILE` pages. They are both
 present for `COLUMN_CHUNK` pages and identify the column chunk whose page-ordinal domain the payload
 describes.
+
+The module descriptor is not a data-bearing module struct. Placement, statistics, and page-index
+values exist only in array-page payloads. Its `version` defines which pages are required and their
+semantics. Existing versions and page meanings are immutable; an incompatible required-page change
+receives a new module version.
 
 ## Common payload conventions
 
@@ -366,6 +372,11 @@ For an `ARRAY_PAGES` entry, `offset` and `length` locate a compact-Thrift
 `THRIFT` entry, they locate the ordinary compact-Thrift module payload directly. Schema and file
 metadata can therefore remain ordinary Thrift structures, while placement and statistics use array
 pages.
+
+There are no `ColumnChunkMatrix`, `RowGroupStatsMatrix`, `OffsetIndexChunk`, or `ColumnIndexChunk`
+storage structs in this representation. Their former fields are independently framed array pages.
+Only schema and descriptive file metadata retain data-bearing structs because readers consume them
+in full and they do not require projected element access.
 
 `SCHEMA` and `PLACEMENT` are required module entries. Other entries are optional. A reader fetches a
 module descriptor only when the query needs that module: reading placement does not fetch or decode
