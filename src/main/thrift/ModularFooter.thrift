@@ -38,43 +38,46 @@ namespace cpp parquet.modular
 namespace java org.apache.parquet.format.modular
 
 /**
- * Raw array encodings. Neither applies general-purpose compression.
- *
- * Values are always bit-packed and stored present-only, so the payload size tracks the number of
- * positions that actually have a value. The two encodings differ only in how the set of present
- * positions is recorded. There is no separate dense encoding: a fully populated array is the
- * all-ones case of BITSET, where the presence bitset compresses to almost nothing and the
- * present-only values are already the full-length array.
+ * Raw array encodings. Neither applies general-purpose compression. Values are always bit-packed;
+ * the encodings differ in how presence is recorded and whether absent positions take a value slot.
+ * There is no separate dense encoding: a fully populated array is BITSET with no stored bitmap
+ * (bitset_bytes = 0), which is just a plain full-length packed array.
  */
 enum ArrayEncoding {
   /**
-   * Presence as a bitset (one bit per logical position) followed by the bit-packed present-only
-   * values. The bitset is all-ones-aware, so a fully populated array costs almost nothing to mark
-   * present, and a small rank index gives O(1) random access. Best from fully dense down to
-   * moderately sparse.
+   * A validity bitset (one bit per logical position) followed by a full-length value stream that
+   * holds one bit-packed value per position. Value i is read directly at bit offset
+   * i * value_bit_width, with no rank step; the bitset only says whether that value is present. An
+   * absent position still occupies a slot holding an unspecified placeholder. bitset_bytes = 0
+   * means every position is present and no bitmap is stored (the dense case). Best from fully dense
+   * to moderately sparse, where a slot for the few absent positions costs less than giving up
+   * direct random access.
    */
   BITSET = 0,
   /**
-   * Presence as a bit-packed sorted list of present logical positions followed by the bit-packed
-   * present-only values. Position lookup is O(log num_present). Smaller than BITSET only in the
-   * very-sparse tail, where the position list costs less than one bit per logical position.
+   * A bit-packed sorted list of present logical positions followed by the bit-packed present-only
+   * values; absent positions take no slot. Position lookup is O(log num_present) by binary search.
+   * Smaller than BITSET only in the very-sparse tail, where BITSET's full-length value stream would
+   * spend most of its slots on absent positions.
    */
   PRESENT_INDEX = 1
 }
 
 /** Parameters for a BITSET payload. */
 struct BitsetParameters {
-  /** Number of logical positions whose presence bit is set (popcount of the bitset). */
-  1: required i32 num_present,
-  /** Width of each present integer value, or each BYTE_ARRAY cumulative offset, in bits. */
-  2: required i8 value_bit_width,
   /**
-   * Byte length of the presence-bitset region at the start of the payload. The bitset is
-   * run-length coded and all-ones-aware, so a fully populated array costs almost nothing; this
-   * length locates the present values, which begin at ArrayPage.offset + bitset_bytes. A reader
-   * builds any rank index over this region in memory.
+   * Width of each value in the full-length value stream, or each BYTE_ARRAY cumulative offset,
+   * in bits.
    */
-  3: required i32 bitset_bytes
+  1: required i8 value_bit_width,
+  /**
+   * Byte length of the validity-bitset region at the start of the payload. The bitset is
+   * run-length coded and all-ones-aware; bitset_bytes = 0 means every position is present and no
+   * bitmap is stored (the dense case). The full-length value stream begins at
+   * ArrayPage.offset + bitset_bytes and holds ArrayPage.num_values values, so value i is addressed
+   * directly with no rank index.
+   */
+  2: required i32 bitset_bytes
 }
 
 /** Parameters for a PRESENT_INDEX payload. */
@@ -97,9 +100,11 @@ union ArrayEncodingParameters {
  * Descriptor for one raw array payload.
  *
  * The payload begins at the absolute file offset and contains exactly length bytes. num_values is
- * the size of the complete logical domain, including absent positions; only present positions have
- * an entry in the values stream. The containing typed module field defines whether values are
- * BOOLEAN, UINT32, UINT64, or BYTE_ARRAY and defines the logical indexing domain.
+ * the size of the complete logical domain, including absent positions. Under BITSET the value
+ * stream has one entry per position (an absent position holds an unspecified placeholder the reader
+ * must not use); under PRESENT_INDEX only present positions have an entry. The containing typed
+ * module field defines whether values are BOOLEAN, UINT32, UINT64, or BYTE_ARRAY and defines the
+ * logical indexing domain.
  */
 struct ArrayPage {
   1: required i64 offset,

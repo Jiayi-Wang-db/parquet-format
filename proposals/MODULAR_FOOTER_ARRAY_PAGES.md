@@ -64,13 +64,15 @@ The containing typed field supplies the values' meaning, type, and indexing doma
 supplies only the physical encoding. The normative definitions are in
 [`ModularFooter.thrift`](../src/main/thrift/ModularFooter.thrift).
 
-The initial format defines two uncompressed encodings. Both store values bit-packed and
-present-only and differ only in how present positions are recorded; there is no separate dense
+The initial format defines two uncompressed encodings. Both bit-pack their values; they differ in
+how presence is recorded and whether absent positions take a value slot. There is no separate dense
 encoding:
 
-* `BITSET`: a presence bitset plus present-only values; the all-ones case is a fully dense array.
-* `PRESENT_INDEX`: a sorted list of present positions plus present-only values, for the
-  very-sparse tail.
+* `BITSET`: a validity bitset plus a full-length value stream (one value per position), so value
+  `i` is read directly with no rank step. The all-ones case stores no bitmap and is a fully dense
+  array.
+* `PRESENT_INDEX`: a sorted list of present positions plus present-only values, for the very-sparse
+  tail.
 
 ## Rationale
 
@@ -142,8 +144,8 @@ their logical position. Per-column arrays contain `num_columns` positions. Array
 `OffsetIndexChunk` or `ColumnIndexChunk` use that column chunk's data-page ordinal as their logical
 position.
 
-`ArrayPage.num_values` always describes the complete logical domain. Only present positions have an
-entry in the values stream; absent positions are still counted in `num_values`.
+`ArrayPage.num_values` always describes the complete logical domain. Under `BITSET` the value
+stream has one entry per position; under `PRESENT_INDEX` only present positions have an entry.
 
 ## Common packed-stream rules
 
@@ -169,18 +171,24 @@ derived length arithmetic MUST be checked for overflow before reading or allocat
 
 ## BITSET encoding
 
-`BITSET` records presence as a bitset covering all `num_values` logical positions, bit `i` set when
-position `i` has a value, followed by the bit-packed present-only values:
+`BITSET` stores a validity bitset covering all `num_values` positions, bit `i` set when position
+`i` has a value, followed by a **full-length** value stream with one bit-packed value per position:
 
 ```text
-[presence bitset][packed present values]
+[validity bitset][full-length packed values]
 ```
 
-The bitset region is `bitset_bytes` long and is run-length, all-ones-aware coded, so a fully
-populated array records presence in almost no space; there is no separate dense encoding. The
-present values begin at `ArrayPage.offset + bitset_bytes`. A reader builds a small rank index over
-the bitset in memory for O(1) lookup: position `i` is present when its bit is set, and its value is
-at present ordinal `rank(i)` in the values stream.
+Because the value stream has one slot per position, value `i` is read directly at bit offset
+`i * value_bit_width` (for a `BYTE_ARRAY` field, through the `num_values + 1` cumulative offsets),
+with no rank step; the bitset only says whether that value is present. An absent position still
+occupies a slot holding an unspecified placeholder (an empty entry for `BYTE_ARRAY`) that a reader
+MUST NOT use.
+
+The bitset region is `bitset_bytes` long, run-length and all-ones-aware coded. `bitset_bytes = 0`
+means every position is present and no bitmap is stored: the dense case, identical to a plain
+full-length packed array. The value stream begins at `ArrayPage.offset + bitset_bytes`. `BITSET` is
+best from fully dense to moderately sparse, where a slot for the few absent positions costs less
+than giving up direct random access.
 
 Integer and boolean values form a fixed-width stream of `num_present` values using
 `value_bit_width`. For a `BYTE_ARRAY` field, the values region is:
@@ -213,9 +221,9 @@ Integer and boolean values use `value_bit_width`. For a `BYTE_ARRAY` field, the 
 ```
 
 Lookup is `O(log num_present)`. `PRESENT_INDEX` is smaller than `BITSET` only in the very-sparse
-tail, where the position list costs less than one bit per logical position. A missing position
-means the source field was absent; a present zero or empty value stays in the values stream, so
-`PRESENT_INDEX` MUST NOT be used merely to omit zeros.
+tail, where `BITSET`'s full-length value stream would spend most of its slots on absent positions.
+A missing position means the source field was absent; a present zero or empty value stays in the
+values stream, so `PRESENT_INDEX` MUST NOT be used merely to omit zeros.
 
 ## Typed placement and statistics
 
