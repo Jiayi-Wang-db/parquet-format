@@ -43,7 +43,7 @@ ModularFooter
   -> RowGroupStatisticsModule (compact Thrift)
        -> column_offsets: ArrayPage
             -> ColumnStatistics for projected column
-                 -> min_values: ArrayPage
+                 -> min_suffixes: ArrayPage
                       -> raw encoded minima
 ```
 
@@ -64,10 +64,13 @@ The containing typed field supplies the values' meaning, type, and indexing doma
 supplies only the physical encoding. The normative definitions are in
 [`ModularFooter.thrift`](../src/main/thrift/ModularFooter.thrift).
 
-The initial format defines two uncompressed encodings:
+The initial format defines two uncompressed encodings. Both store values bit-packed and
+present-only and differ only in how present positions are recorded; there is no separate dense
+encoding:
 
-* `BIT_PACKED` for dense positional arrays.
-* `SPARSE` for optional arrays with relatively few present positions.
+* `BITSET`: a presence bitset plus present-only values; the all-ones case is a fully dense array.
+* `PRESENT_INDEX`: a sorted list of present positions plus present-only values, for the
+  very-sparse tail.
 
 ## Rationale
 
@@ -139,8 +142,8 @@ their logical position. Per-column arrays contain `num_columns` positions. Array
 `OffsetIndexChunk` or `ColumnIndexChunk` use that column chunk's data-page ordinal as their logical
 position.
 
-`ArrayPage.num_values` always describes the complete logical domain. Under `SPARSE`, absent
-positions are included in `num_values` but have no entry in the values stream.
+`ArrayPage.num_values` always describes the complete logical domain. Only present positions have an
+entry in the values stream; absent positions are still counted in `num_values`.
 
 ## Common packed-stream rules
 
@@ -164,51 +167,53 @@ The containing Thrift field defines the value type:
 Width zero represents an all-zero integer or offset stream and consumes no payload bytes. All
 derived length arithmetic MUST be checked for overflow before reading or allocating memory.
 
-## BIT_PACKED encoding
+## BITSET encoding
 
-`BIT_PACKED` stores one value at every logical position.
-
-For integer and boolean fields, the payload is one stream of `num_values` fixed-width values. Value
-`i` begins at bit offset `i * bit_width`, so it can be read without decoding preceding values.
-
-For a `BYTE_ARRAY` field, the payload is:
+`BITSET` records presence as a bitset of `num_values` bits, bit `i` set when logical position `i`
+has a value, followed by the bit-packed present-only values:
 
 ```text
-[num_values + 1 packed cumulative offsets][concatenated bytes]
+[presence bitset][packed present values]
 ```
 
-The first offset MUST be zero, offsets MUST be nondecreasing, and the last offset MUST equal the
-length of the concatenated byte region. Value `i` is
-`data[offset[i] .. offset[i + 1]]`.
+A fully populated array is the all-ones case, which a writer MAY store as a compact run, so there
+is no separate dense encoding. A small rank index over the bitset gives O(1) lookup: position `i`
+is present when its bit is set, and its value is at present ordinal `rank(i)` in the values stream.
 
-Writers MUST use the minimum width needed for the largest integer or offset. Readers MUST accept a
-larger valid width.
-
-## SPARSE encoding
-
-`SPARSE` distinguishes an absent field from a present zero or empty value. Its payload begins with
-`num_present` sorted logical positions:
-
-```text
-[packed present positions][packed present values]
-```
-
-Positions MUST be strictly increasing and less than `ArrayPage.num_values`. They use
-`position_bit_width`. A reader finds logical position `i` by binary-searching this fixed-width
-stream. If found at present ordinal `k`, its value is value `k`; otherwise the field is absent.
-
-Integer and boolean values form a fixed-width stream using `value_bit_width`. For a `BYTE_ARRAY`
-field, the values region is:
+Integer and boolean values form a fixed-width stream of `num_present` values using
+`value_bit_width`. For a `BYTE_ARRAY` field, the values region is:
 
 ```text
 [num_present + 1 packed cumulative offsets][concatenated bytes]
 ```
 
-This gives `O(log num_present)` position lookup and direct access to the corresponding value,
-without a bitmap rank operation or prefix scan.
+The first offset MUST be zero, offsets MUST be nondecreasing, and the last offset MUST equal the
+length of the concatenated byte region. `BITSET` spans fully dense to moderately sparse, because
+the bitset costs one bit per logical position regardless of how many are set. Writers MUST use the
+minimum value width; readers MUST accept a larger valid width.
 
-`SPARSE` MUST NOT be used merely to omit zero values. A missing position means the corresponding
-source field was absent. A present zero remains in the values stream.
+## PRESENT_INDEX encoding
+
+`PRESENT_INDEX` records presence as a bit-packed sorted list of present logical positions, followed
+by the bit-packed present-only values:
+
+```text
+[packed present positions][packed present values]
+```
+
+Positions MUST be strictly increasing and less than `ArrayPage.num_values`, using
+`position_bit_width`. A reader finds logical position `i` by binary-searching this fixed-width
+stream; if found at present ordinal `k` its value is value `k`, otherwise the position is absent.
+Integer and boolean values use `value_bit_width`. For a `BYTE_ARRAY` field, the values region is:
+
+```text
+[num_present + 1 packed cumulative offsets][concatenated bytes]
+```
+
+Lookup is `O(log num_present)`. `PRESENT_INDEX` is smaller than `BITSET` only in the very-sparse
+tail, where the position list costs less than one bit per logical position. A missing position
+means the source field was absent; a present zero or empty value stays in the values stream, so
+`PRESENT_INDEX` MUST NOT be used merely to omit zeros.
 
 ## Typed placement and statistics
 
@@ -228,7 +233,8 @@ struct PlacementModule {
 }
 ```
 
-Placement fields are dense and use `BIT_PACKED`. Statistics first select a leaf column:
+Placement fields are dense and use the all-ones case of `BITSET`. Statistics first select a leaf
+column:
 
 ```thrift
 struct RowGroupStatisticsModule {
@@ -238,19 +244,24 @@ struct RowGroupStatisticsModule {
 
 struct ColumnStatistics {
   1: optional ArrayPage null_counts;
-  2: optional ArrayPage min_values;
-  3: optional ArrayPage max_values;
-  4: optional ArrayPage min_is_exact;
-  5: optional ArrayPage max_is_exact;
-  6: optional ArrayPage nan_counts;
+  2: optional ArrayPage minmax_prefixes;
+  3: optional ArrayPage min_suffixes;
+  4: optional ArrayPage max_suffixes;
+  5: optional ArrayPage min_is_exact;
+  6: optional ArrayPage max_is_exact;
+  7: optional ArrayPage nan_counts;
 }
 ```
 
 Equal adjacent column offsets mean that the leaf column has no row-group statistics. Within a
 `ColumnStatistics` descriptor, an optional field being absent means that no row group has that
-statistic. When only some row groups have it, the field is present and its page uses `SPARSE`.
-`min_values` and `max_values` MUST use identical present positions; a writer MUST NOT encode one
-bound without the other. Exactness values are defined only for those same positions.
+statistic. When only some row groups have it, the field is present and its page uses
+`PRESENT_INDEX` or `BITSET`. A row group's min and max usually share a leading run of bytes; that
+longest common prefix is stored once in `minmax_prefixes`, and `min_suffixes` / `max_suffixes`
+carry only the differing tails. These three arrays MUST use identical present positions; a writer
+MUST NOT encode one bound without the other. Exactness values are defined only for those same
+positions, and a bound MAY be truncated (its exactness bit is then cleared) so long as a truncated
+minimum rounds down and a truncated maximum rounds up.
 
 ## Page indexes
 
@@ -285,8 +296,8 @@ The format evolves at two existing boundaries:
 * Add an optional field to a typed module using normal Thrift evolution.
 * Add a new `ArrayEncoding` value when introducing a new payload layout.
 
-The meaning of an existing encoding value never changes. For example, a future sparse encoding
-with a rank index receives a new identifier rather than changing `SPARSE`.
+The meaning of an existing encoding value never changes. A new payload layout receives a new
+`ArrayEncoding` identifier rather than redefining `BITSET` or `PRESENT_INDEX`.
 
 Each page chooses its encoding independently, so a writer may use a new encoding only where it is
 beneficial. A reader can determine support from the containing `ArrayPage` before fetching the raw
@@ -306,9 +317,9 @@ A conforming reader MUST reject a modular footer when:
 * An `ArrayPage` has an encoding/parameter union mismatch.
 * A count, width, offset, length, or derived length is invalid or overflows.
 * A payload range falls outside the file.
-* Sparse positions are not strictly increasing or exceed the logical domain.
+* `PRESENT_INDEX` positions are not strictly increasing or exceed the logical domain.
 * Byte-array offsets decrease or do not terminate at the data length.
-* Paired min/max pages use different sparse positions.
+* The minmax_prefixes, min_suffixes, and max_suffixes pages use different present positions.
 * Parallel arrays have inconsistent logical cardinalities.
 
 Readers SHOULD impose implementation limits on array cardinality and payload length before
@@ -326,7 +337,7 @@ The minimum evaluation reports:
 * Thrift module and `ArrayPage` descriptor overhead.
 * Placement-read time for 1, 5, and all projected columns.
 * Sparse-statistics read time for the same projections.
-* `BIT_PACKED` versus `SPARSE` size and lookup cost for eligible fields.
+* `BITSET` versus `PRESENT_INDEX` size and lookup cost for eligible fields.
 * Per-column encrypted-statistics overhead.
 * Malformed-input and cross-implementation round trips.
 
@@ -335,8 +346,8 @@ Success means preserving projection-scaled access and approximately the same siz
 
 ## Open questions
 
-1. Should `BIT_PACKED` versus `SPARSE` selection be entirely writer-controlled or use a normative
-   size threshold?
+1. Should `BITSET` versus `PRESENT_INDEX` selection be entirely writer-controlled or use a
+   normative size threshold?
 2. Should `ArrayPage.length` remain `i32`, like Parquet page sizes, or use `i64` for consistency
    with module ranges?
 3. Which array and module size limits should be normative?

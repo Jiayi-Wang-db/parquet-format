@@ -37,43 +37,62 @@ include "parquet.thrift"
 namespace cpp parquet.modular
 namespace java org.apache.parquet.format.modular
 
-/** Initial raw array encodings. Neither applies general-purpose compression. */
+/**
+ * Raw array encodings. Neither applies general-purpose compression.
+ *
+ * Values are always bit-packed and stored present-only, so the payload size tracks the number of
+ * positions that actually have a value. The two encodings differ only in how the set of present
+ * positions is recorded. There is no separate dense encoding: a fully populated array is the
+ * all-ones case of BITSET, where the presence bitset compresses to almost nothing and the
+ * present-only values are already the full-length array.
+ */
 enum ArrayEncoding {
-  /** Dense fixed-width values, one value at every logical position. */
-  BIT_PACKED = 0,
-  /** Sorted present positions followed by their fixed-width values. */
-  SPARSE = 1
+  /**
+   * Presence as a bitset (one bit per logical position) followed by the bit-packed present-only
+   * values. The bitset is all-ones-aware, so a fully populated array costs almost nothing to mark
+   * present, and a small rank index gives O(1) random access. Best from fully dense down to
+   * moderately sparse.
+   */
+  BITSET = 0,
+  /**
+   * Presence as a bit-packed sorted list of present logical positions followed by the bit-packed
+   * present-only values. Position lookup is O(log num_present). Smaller than BITSET only in the
+   * very-sparse tail, where the position list costs less than one bit per logical position.
+   */
+  PRESENT_INDEX = 1
 }
 
-/** Parameters for a dense BIT_PACKED payload. */
-struct BitPackedParameters {
-  /** Width of each integer value, or each BYTE_ARRAY cumulative offset, in bits. */
-  1: required i8 bit_width
+/** Parameters for a BITSET payload. */
+struct BitsetParameters {
+  /** Number of logical positions whose presence bit is set. */
+  1: required i32 num_present,
+  /** Width of each present integer value, or each BYTE_ARRAY cumulative offset, in bits. */
+  2: required i8 value_bit_width
 }
 
-/** Parameters for a SPARSE payload. */
-struct SparseParameters {
+/** Parameters for a PRESENT_INDEX payload. */
+struct PresentIndexParameters {
   /** Number of logical positions that have a value. */
   1: required i32 num_present,
   /** Width of each entry in the sorted logical-position stream, in bits. */
   2: required i8 position_bit_width,
-  /** Width of each integer value, or each BYTE_ARRAY cumulative offset, in bits. */
+  /** Width of each present integer value, or each BYTE_ARRAY cumulative offset, in bits. */
   3: required i8 value_bit_width
 }
 
 /** Exactly one member MUST be set, matching ArrayPage.encoding. */
 union ArrayEncodingParameters {
-  1: BitPackedParameters bit_packed,
-  2: SparseParameters sparse
+  1: BitsetParameters bitset,
+  2: PresentIndexParameters present_index
 }
 
 /**
  * Descriptor for one raw array payload.
  *
- * The payload begins at the absolute file offset and contains exactly length bytes. Its decoded
- * cardinality is num_values, including absent logical positions under SPARSE. The containing typed
- * module field defines whether values are BOOLEAN, UINT32, UINT64, or BYTE_ARRAY and defines the
- * logical indexing domain.
+ * The payload begins at the absolute file offset and contains exactly length bytes. num_values is
+ * the size of the complete logical domain, including absent positions; only present positions have
+ * an entry in the values stream. The containing typed module field defines whether values are
+ * BOOLEAN, UINT32, UINT64, or BYTE_ARRAY and defines the logical indexing domain.
  */
 struct ArrayPage {
   1: required i64 offset,
@@ -99,8 +118,8 @@ struct SchemaModule {
  * Placement for every column chunk.
  *
  * Unless noted otherwise, pages contain num_columns * num_row_groups UINT64 values in column-major
- * chunk space: chunk (column c, row group g) is at c * num_row_groups + g. These required arrays
- * use BIT_PACKED because every column chunk has a value.
+ * chunk space: chunk (column c, row group g) is at c * num_row_groups + g. Every column chunk has a
+ * value, so these required arrays use the all-ones case of BITSET.
  */
 struct PlacementModule {
   /** UINT64: first data-page byte offset. */
@@ -123,20 +142,29 @@ struct PlacementModule {
   9: required ArrayPage is_fully_dictionary_encoded
 }
 
-/** Row-group statistics for one leaf column; array positions are row-group ordinals. */
+/**
+ * Row-group statistics for one leaf column; array positions are row-group ordinals.
+ *
+ * A row group's min and max often share a leading run of bytes (timestamps, sorted keys). That
+ * longest common prefix is stored once in minmax_prefixes, and min_suffixes / max_suffixes carry
+ * only the differing tails, so a long shared prefix is never written twice. The three arrays share
+ * present positions: a row group that has a min/max has an entry in all three.
+ */
 struct ColumnStatistics {
   /** UINT64: optional null count for each row group. */
   1: optional ArrayPage null_counts,
-  /** BYTE_ARRAY: optional encoded minimum for each row group. */
-  2: optional ArrayPage min_values,
-  /** BYTE_ARRAY: optional encoded maximum for each row group. */
-  3: optional ArrayPage max_values,
-  /** BOOLEAN: exactness for each present minimum. */
-  4: optional ArrayPage min_is_exact,
-  /** BOOLEAN: exactness for each present maximum. */
-  5: optional ArrayPage max_is_exact,
+  /** BYTE_ARRAY: longest common prefix of each row group's min and max (empty when none). */
+  2: optional ArrayPage minmax_prefixes,
+  /** BYTE_ARRAY: each present minimum with its minmax_prefixes entry stripped (suffix only). */
+  3: optional ArrayPage min_suffixes,
+  /** BYTE_ARRAY: each present maximum with its minmax_prefixes entry stripped (suffix only). */
+  4: optional ArrayPage max_suffixes,
+  /** BOOLEAN: 1 when the minimum is exact, 0 when it is a truncated (rounded-down) lower bound. */
+  5: optional ArrayPage min_is_exact,
+  /** BOOLEAN: 1 when the maximum is exact, 0 when it is a truncated (rounded-up) upper bound. */
+  6: optional ArrayPage max_is_exact,
   /** UINT64: optional NaN count. */
-  6: optional ArrayPage nan_counts
+  7: optional ArrayPage nan_counts
 }
 
 /**
@@ -164,23 +192,31 @@ struct OffsetIndexChunk {
   3: required ArrayPage first_row_indexes
 }
 
-/** Per-page statistics for one (leaf column, row group) column chunk. */
+/**
+ * Per-page statistics for one (leaf column, row group) column chunk.
+ *
+ * Min and max reuse the same common-prefix stripping as the row-group statistics: each page's
+ * longest common prefix is stored once in minmax_prefixes, and min_suffixes / max_suffixes carry
+ * only the differing tails. The three arrays share present positions.
+ */
 struct ColumnIndexChunk {
   1: required parquet.BoundaryOrder boundary_order,
   /** BOOLEAN: true when the page contains only null values. */
   2: required ArrayPage null_pages,
   /** UINT64: optional null count. */
   3: optional ArrayPage null_counts,
-  /** BYTE_ARRAY: encoded minimum; paired with max_values. */
-  4: optional ArrayPage min_values,
-  /** BYTE_ARRAY: encoded maximum; paired with min_values. */
-  5: optional ArrayPage max_values,
-  /** BOOLEAN: exactness for each present minimum. */
-  6: optional ArrayPage min_is_exact,
-  /** BOOLEAN: exactness for each present maximum. */
-  7: optional ArrayPage max_is_exact,
+  /** BYTE_ARRAY: longest common prefix of each page's min and max (empty when none). */
+  4: optional ArrayPage minmax_prefixes,
+  /** BYTE_ARRAY: each present minimum with its minmax_prefixes entry stripped (suffix only). */
+  5: optional ArrayPage min_suffixes,
+  /** BYTE_ARRAY: each present maximum with its minmax_prefixes entry stripped (suffix only). */
+  6: optional ArrayPage max_suffixes,
+  /** BOOLEAN: 1 when the minimum is exact, 0 when it is a truncated (rounded-down) lower bound. */
+  7: optional ArrayPage min_is_exact,
+  /** BOOLEAN: 1 when the maximum is exact, 0 when it is a truncated (rounded-up) upper bound. */
+  8: optional ArrayPage max_is_exact,
   /** UINT64: optional NaN count. */
-  8: optional ArrayPage nan_counts
+  9: optional ArrayPage nan_counts
 }
 
 /**
