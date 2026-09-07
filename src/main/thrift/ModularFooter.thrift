@@ -18,12 +18,11 @@
  */
 
 /**
- * Modular Footer: typed Thrift modules whose array fields point to raw encoded pages.
+ * Modular Footer: typed Thrift modules whose array fields hold their encoded values inline.
  *
- * ArrayPage is both the location and header of an array payload. The payload at ArrayPage.offset
- * contains exactly ArrayPage.length raw bytes; it is not a Thrift binary field and has no separate
- * page header. The typed field containing ArrayPage defines the values' meaning, type, and logical
- * domain. ArrayPage defines only their physical encoding.
+ * ArrayPage carries the encoded array bytes inline in its data field, with the encoding, value
+ * count, and parameters beside it as typed fields. The typed field containing ArrayPage defines the
+ * values' meaning, type, and logical domain; ArrayPage defines only their physical encoding.
  *
  * Modules preserve independent read lifecycles. A reader can fetch placement without fetching
  * row-group statistics, and can fetch per-page indexes only for projected column chunks. Schema
@@ -71,11 +70,10 @@ struct BitsetParameters {
    */
   1: required i8 value_bit_width,
   /**
-   * Byte length of the validity-bitset region at the start of the payload. The bitset is
-   * run-length coded and all-ones-aware; bitset_bytes = 0 means every position is present and no
-   * bitmap is stored (the dense case). The full-length value stream begins at
-   * ArrayPage.offset + bitset_bytes and holds ArrayPage.num_values values, so value i is addressed
-   * directly with no rank index.
+   * Byte length of the validity-bitset region at the start of data. The bitset is run-length coded
+   * and all-ones-aware; bitset_bytes = 0 means every position is present and no bitmap is stored
+   * (the dense case). The full-length value stream begins at byte bitset_bytes of data and holds
+   * ArrayPage.num_values values, so value i is addressed directly with no rank index.
    */
   2: required i32 bitset_bytes
 }
@@ -97,21 +95,20 @@ union ArrayEncodingParameters {
 }
 
 /**
- * Descriptor for one raw array payload.
+ * One encoded array, stored inline.
  *
- * The payload begins at the absolute file offset and contains exactly length bytes. num_values is
- * the size of the complete logical domain, including absent positions. Under BITSET the value
- * stream has one entry per position (an absent position holds an unspecified placeholder the reader
- * must not use); under PRESENT_INDEX only present positions have an entry. The containing typed
- * module field defines whether values are BOOLEAN, UINT32, UINT64, or BYTE_ARRAY and defines the
- * logical indexing domain.
+ * data holds the encoded array bytes directly in the module, rather than an offset and length
+ * pointing to a payload elsewhere in the file. num_values is the size of the complete logical
+ * domain, including absent positions. Under BITSET the value stream has one entry per position (an
+ * absent position holds an unspecified placeholder the reader must not use); under PRESENT_INDEX
+ * only present positions have an entry. The containing typed module field defines whether values
+ * are BOOLEAN, UINT32, UINT64, or BYTE_ARRAY and defines the logical indexing domain.
  */
 struct ArrayPage {
-  1: required i64 offset,
-  2: required i32 length,
-  3: required ArrayEncoding encoding,
-  4: required i32 num_values,
-  5: required ArrayEncodingParameters parameters
+  1: required binary data,
+  2: required ArrayEncoding encoding,
+  3: required i32 num_values,
+  4: required ArrayEncodingParameters parameters
 }
 
 /** Absolute location of one independently compact-Thrift serialized module. */
@@ -184,8 +181,8 @@ struct ColumnStatistics {
  *
  * column_offsets contains num_columns + 1 dense UINT64 absolute file offsets. Entries c and c+1
  * delimit the descriptor for leaf column c. Equal offsets mean that the column has no row-group
- * statistics. A per-column encryption envelope may cover the descriptor and all of its array-page
- * payloads so one column key protects the column's statistics as a unit.
+ * statistics. A per-column encryption envelope may cover the descriptor and its inline arrays so
+ * one column key protects the column's statistics as a unit.
  */
 struct RowGroupStatisticsModule {
   1: required ArrayPage column_offsets

@@ -30,33 +30,29 @@ Status: DRAFT
 ## Description
 
 The modular footer remains a collection of typed Thrift modules. Array-valued fields do not store
-their values in Thrift lists or `binary` fields. Instead, each field contains an `ArrayPage`
-descriptor pointing to a raw encoded payload elsewhere in the file:
+their values as Thrift lists. Instead, each field contains an `ArrayPage` that holds the encoded
+array inline, as a `binary` payload with its encoding metadata beside it:
 
 ```text
 ModularFooter
   -> PlacementModule (compact Thrift)
-       -> data_page_offsets: ArrayPage
-            -> raw encoded offsets
-       -> total_compressed_sizes: ArrayPage
-            -> raw encoded sizes
+       -> data_page_offsets: ArrayPage { data = raw encoded offsets, ... }
+       -> total_compressed_sizes: ArrayPage { data = raw encoded sizes, ... }
   -> RowGroupStatisticsModule (compact Thrift)
-       -> column_offsets: ArrayPage
+       -> column_offsets: ArrayPage (offsets locating per-column descriptors)
             -> ColumnStatistics for projected column
-                 -> min_suffixes: ArrayPage
-                      -> raw encoded minima
+                 -> min_suffixes: ArrayPage { data = raw encoded minima, ... }
 ```
 
-`ArrayPage` is both the location and header of the payload. There is no additional Thrift page
-header at the payload offset:
+`ArrayPage` carries the encoded array inline in `data`, with the encoding, value count, and
+parameters beside it as typed fields:
 
 ```thrift
 struct ArrayPage {
-  1: required i64 offset;
-  2: required i32 length;
-  3: required ArrayEncoding encoding;
-  4: required i32 num_values;
-  5: required ArrayEncodingParameters parameters;
+  1: required binary data;
+  2: required ArrayEncoding encoding;
+  3: required i32 num_values;
+  4: required ArrayEncodingParameters parameters;
 }
 ```
 
@@ -76,19 +72,16 @@ encoding:
 
 ## Rationale
 
-Compact Thrift lists are sequential. Finding element `i` in a `list<i64>` requires parsing all
-preceding compact integers. This makes a narrow projection walk metadata for columns it will not
-read. Storing custom encodings in Thrift `binary` fields restores random access, but makes the
-Thrift schema misleading: the actual type and representation are hidden inside opaque bytes.
+Compact Thrift lists are sequential: finding element `i` in a `list<i64>` requires parsing all
+preceding compact integers, so a narrow projection would walk metadata for columns it will not
+read. `ArrayPage` instead puts the values in a randomly addressable `binary` field, while keeping
+the encoding, value type, count, and parameters as typed Thrift fields beside it, so the schema
+stays explicit rather than opaque bytes.
 
-An `ArrayPage` makes the boundary explicit:
-
-* Thrift defines the footer schema, module boundaries, field meaning, locations, and encoding tags.
-* Raw payloads contain the independently addressable arrays.
-
-Typed module structs are retained because they make the format understandable and evolvable. They
-are page directories, not containers for the metadata values themselves. Adding an optional
-metadata field is an ordinary optional Thrift-field addition.
+The array bytes live inline in the module, not at a separate file offset. The module is already the
+unit of independent fetch and encryption (located from the root), so inlining avoids a second level
+of indirection and an offset and length per array, and keeps each module self-contained. Adding an
+optional metadata field is an ordinary optional Thrift-field addition.
 
 ## Modules
 
@@ -103,8 +96,8 @@ Modules preserve independent read lifecycles:
 | Column index | per-chunk typed descriptors | Read only for selected column chunks. |
 | File metadata | ordinary typed Thrift | Read only when descriptive metadata is needed. |
 
-Placement and statistics never share a module or payload. A reader can locate column data without
-fetching, decrypting, or understanding statistics.
+Placement and statistics never share a module. A reader can locate column data without fetching,
+decrypting, or understanding statistics.
 
 The root contains typed locations rather than a generic module registry:
 
@@ -186,7 +179,7 @@ MUST NOT use.
 
 The bitset region is `bitset_bytes` long, run-length and all-ones-aware coded. `bitset_bytes = 0`
 means every position is present and no bitmap is stored: the dense case, identical to a plain
-full-length packed array. The value stream begins at `ArrayPage.offset + bitset_bytes`. `BITSET` is
+full-length packed array. The value stream begins at byte `bitset_bytes` of `data`. `BITSET` is
 best from fully dense to moderately sparse, where a slot for the few absent positions costs less
 than giving up direct random access.
 
@@ -291,9 +284,9 @@ arrays. Reading one projected chunk does not materialize descriptors for other c
 
 ## Encryption
 
-Placement remains independently readable. Each `ColumnStatistics` descriptor and its array-page
-payloads form one segment that can be encrypted with that column's key, amortizing nonce and
-authentication-tag overhead across all row groups and statistic fields. The array-page encoding is
+Placement remains independently readable. Each `ColumnStatistics` descriptor, with its inline
+arrays, forms one segment that can be encrypted with that column's key, amortizing nonce and
+authentication-tag overhead across all row groups and statistic fields. The array encoding is
 applied before encryption; ciphertext is not treated as packed values.
 
 The exact modular-encryption envelope and AAD construction are specified separately. In
@@ -310,8 +303,8 @@ The meaning of an existing encoding value never changes. A new payload layout re
 `ArrayEncoding` identifier rather than redefining `BITSET` or `PRESENT_INDEX`.
 
 Each page chooses its encoding independently, so a writer may use a new encoding only where it is
-beneficial. A reader can determine support from the containing `ArrayPage` before fetching the raw
-payload.
+beneficial. A reader can determine support from the containing `ArrayPage` before decoding the
+array.
 
 An unsupported optional statistics or index field disables that optimization. An unsupported
 required placement field makes the modular footer unusable. During migration, a reader can fall
@@ -326,7 +319,7 @@ A conforming reader MUST reject a modular footer when:
 * A required placement field is missing.
 * An `ArrayPage` has an encoding/parameter union mismatch.
 * A count, width, offset, length, or derived length is invalid or overflows.
-* A payload range falls outside the file.
+* An array's decoded regions run past the end of its inline `data`.
 * `PRESENT_INDEX` positions are not strictly increasing or exceed the logical domain.
 * Byte-array offsets decrease or do not terminate at the data length.
 * The minmax_prefixes, min_suffixes, and max_suffixes pages use different present positions.
@@ -344,7 +337,7 @@ row groups and files with sparse statistics.
 The minimum evaluation reports:
 
 * Total footer and always-fetched tail bytes.
-* Thrift module and `ArrayPage` descriptor overhead.
+* Thrift module and `ArrayPage` framing overhead.
 * Placement-read time for 1, 5, and all projected columns.
 * Sparse-statistics read time for the same projections.
 * `BITSET` versus `PRESENT_INDEX` size and lookup cost for eligible fields.
@@ -358,6 +351,4 @@ Success means preserving projection-scaled access and approximately the same siz
 
 1. Should `BITSET` versus `PRESENT_INDEX` selection be entirely writer-controlled or use a
    normative size threshold?
-2. Should `ArrayPage.length` remain `i32`, like Parquet page sizes, or use `i64` for consistency
-   with module ranges?
-3. Which array and module size limits should be normative?
+2. Which array and module size limits should be normative?
