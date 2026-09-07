@@ -169,16 +169,18 @@ derived length arithmetic MUST be checked for overflow before reading or allocat
 
 ## BITSET encoding
 
-`BITSET` records presence as a bitset of `num_values` bits, bit `i` set when logical position `i`
-has a value, followed by the bit-packed present-only values:
+`BITSET` records presence as a bitset covering all `num_values` logical positions, bit `i` set when
+position `i` has a value, followed by the bit-packed present-only values:
 
 ```text
 [presence bitset][packed present values]
 ```
 
-A fully populated array is the all-ones case, which a writer MAY store as a compact run, so there
-is no separate dense encoding. A small rank index over the bitset gives O(1) lookup: position `i`
-is present when its bit is set, and its value is at present ordinal `rank(i)` in the values stream.
+The bitset region is `bitset_bytes` long and is run-length, all-ones-aware coded, so a fully
+populated array records presence in almost no space; there is no separate dense encoding. The
+present values begin at `ArrayPage.offset + bitset_bytes`. A reader builds a small rank index over
+the bitset in memory for O(1) lookup: position `i` is present when its bit is set, and its value is
+at present ordinal `rank(i)` in the values stream.
 
 Integer and boolean values form a fixed-width stream of `num_present` values using
 `value_bit_width`. For a `BYTE_ARRAY` field, the values region is:

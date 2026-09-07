@@ -64,10 +64,17 @@ enum ArrayEncoding {
 
 /** Parameters for a BITSET payload. */
 struct BitsetParameters {
-  /** Number of logical positions whose presence bit is set. */
+  /** Number of logical positions whose presence bit is set (popcount of the bitset). */
   1: required i32 num_present,
   /** Width of each present integer value, or each BYTE_ARRAY cumulative offset, in bits. */
-  2: required i8 value_bit_width
+  2: required i8 value_bit_width,
+  /**
+   * Byte length of the presence-bitset region at the start of the payload. The bitset is
+   * run-length coded and all-ones-aware, so a fully populated array costs almost nothing; this
+   * length locates the present values, which begin at ArrayPage.offset + bitset_bytes. A reader
+   * builds any rank index over this region in memory.
+   */
+  3: required i32 bitset_bytes
 }
 
 /** Parameters for a PRESENT_INDEX payload. */
