@@ -99,26 +99,39 @@ Modules preserve independent read lifecycles:
 Placement and statistics never share a module. A reader can locate column data without fetching,
 decrypting, or understanding statistics.
 
-The root contains typed locations rather than a generic module registry:
+The root holds a directory that maps each present module to its location, keyed by a `ModuleKind`
+enum:
 
 ```thrift
+enum ModuleKind {
+  SCHEMA = 0;
+  PLACEMENT = 1;
+  ROW_GROUP_STATISTICS = 2;
+  OFFSET_INDEX = 3;
+  COLUMN_INDEX = 4;
+  FILE_METADATA = 5;
+}
+
+struct ModuleDirectoryEntry {
+  1: required ModuleKind kind;
+  2: required ModuleLocation location;
+}
+
 struct ModularFooter {
   1: required i32 version;
   2: required i32 num_row_groups;
   3: required i32 num_columns;
   4: required i64 num_rows;
   5: required list<i64> row_group_num_rows;
-  6: required ModuleLocation schema;
-  7: required ModuleLocation placement;
-  8: optional ModuleLocation row_group_statistics;
-  9: optional ModuleLocation offset_index;
-  10: optional ModuleLocation column_index;
-  11: optional ModuleLocation file_metadata;
+  6: required list<ModuleDirectoryEntry> modules;
 }
 ```
 
-Each location identifies one independently compact-Thrift serialized module. The outer file
-framing that locates `ModularFooter` is specified separately.
+`SCHEMA` and `PLACEMENT` MUST be present; other kinds are optional. A new module kind (a bloom
+filter, say) is added to `ModuleKind` and slotted into the directory without changing the struct,
+and a reader skips entries whose kind it does not understand. Each entry identifies one
+independently compact-Thrift serialized module. The outer file framing that locates `ModularFooter`
+is specified separately.
 
 ## Logical indexing
 
@@ -164,24 +177,23 @@ derived length arithmetic MUST be checked for overflow before reading or allocat
 
 ## BITSET encoding
 
-`BITSET` stores a validity bitset covering all `num_values` positions, bit `i` set when position
-`i` has a value, followed by a **full-length** value stream with one bit-packed value per position:
+`BITSET` stores a **full-length** value stream with one bit-packed value per position, optionally
+preceded by a validity bitmap:
 
 ```text
-[validity bitset][full-length packed values]
+[optional validity bitmap][full-length packed values]
 ```
 
-Because the value stream has one slot per position, value `i` is read directly at bit offset
-`i * value_bit_width` (for a `BYTE_ARRAY` field, through the `num_values + 1` cumulative offsets),
-with no rank step; the bitset only says whether that value is present. An absent position still
-occupies a slot holding an unspecified placeholder (an empty entry for `BYTE_ARRAY`) that a reader
-MUST NOT use.
+Value `i` is read directly at bit offset `i * value_bit_width` (for a `BYTE_ARRAY` field, through
+the `num_values + 1` cumulative offsets), with no rank step; the bitmap only says whether that
+value is present. An absent position still occupies a slot holding an unspecified placeholder (an
+empty entry for `BYTE_ARRAY`) that a reader MUST NOT use.
 
-The bitset region is `bitset_bytes` long, run-length and all-ones-aware coded. `bitset_bytes = 0`
-means every position is present and no bitmap is stored: the dense case, identical to a plain
-full-length packed array. The value stream begins at byte `bitset_bytes` of `data`. `BITSET` is
-best from fully dense to moderately sparse, where a slot for the few absent positions costs less
-than giving up direct random access.
+When `num_present == num_values` every position is present and no bitmap is stored: the dense case,
+identical to a plain full-length packed array. Otherwise a plain `ceil(num_values / 8)`-byte
+validity bitmap precedes the values, bit `i` set when position `i` is present. `BITSET` is best from
+fully dense to moderately sparse, where a slot for the few absent positions costs less than giving
+up direct random access.
 
 Integer and boolean values form a fixed-width stream of `num_present` values using
 `value_bit_width`. For a `BYTE_ARRAY` field, the values region is:

@@ -40,17 +40,15 @@ namespace java org.apache.parquet.format.modular
  * Raw array encodings. Neither applies general-purpose compression. Values are always bit-packed;
  * the encodings differ in how presence is recorded and whether absent positions take a value slot.
  * There is no separate dense encoding: a fully populated array is BITSET with no stored bitmap
- * (bitset_bytes = 0), which is just a plain full-length packed array.
+ * (num_present == num_values), which is just a plain full-length packed array.
  */
 enum ArrayEncoding {
   /**
-   * A validity bitset (one bit per logical position) followed by a full-length value stream that
-   * holds one bit-packed value per position. Value i is read directly at bit offset
-   * i * value_bit_width, with no rank step; the bitset only says whether that value is present. An
-   * absent position still occupies a slot holding an unspecified placeholder. bitset_bytes = 0
-   * means every position is present and no bitmap is stored (the dense case). Best from fully dense
-   * to moderately sparse, where a slot for the few absent positions costs less than giving up
-   * direct random access.
+   * A full-length value stream with one bit-packed value per position, optionally preceded by a
+   * validity bitmap. Value i is read directly at bit offset i * value_bit_width, with no rank step;
+   * the bitmap only says whether that value is present, and an absent position still occupies a
+   * slot holding an unspecified placeholder. When num_present == num_values no bitmap is stored
+   * (the dense case). Best from fully dense to moderately sparse.
    */
   BITSET = 0,
   /**
@@ -70,12 +68,12 @@ struct BitsetParameters {
    */
   1: required i8 value_bit_width,
   /**
-   * Byte length of the validity-bitset region at the start of data. The bitset is run-length coded
-   * and all-ones-aware; bitset_bytes = 0 means every position is present and no bitmap is stored
-   * (the dense case). The full-length value stream begins at byte bitset_bytes of data and holds
-   * ArrayPage.num_values values, so value i is addressed directly with no rank index.
+   * Number of present positions. When num_present == ArrayPage.num_values every position is
+   * present and no validity bitmap is stored (the dense case). Otherwise a plain
+   * ceil(num_values / 8)-byte validity bitmap precedes the full-length value stream, with bit i set
+   * when position i is present.
    */
-  2: required i32 bitset_bytes
+  2: required i32 num_present
 }
 
 /** Parameters for a PRESENT_INDEX payload. */
@@ -245,9 +243,27 @@ struct FileMetadataModule {
   2: optional list<parquet.KeyValue> key_value_metadata
 }
 
+/** Kinds of module the directory can locate. Older readers skip kinds they do not understand. */
+enum ModuleKind {
+  SCHEMA = 0,
+  PLACEMENT = 1,
+  ROW_GROUP_STATISTICS = 2,
+  OFFSET_INDEX = 3,
+  COLUMN_INDEX = 4,
+  FILE_METADATA = 5
+}
+
+/** One directory entry: the location of the module of the given kind. */
+struct ModuleDirectoryEntry {
+  1: required ModuleKind kind,
+  2: required ModuleLocation location
+}
+
 /**
- * The always-read root. Locations point to independently compact-Thrift serialized typed modules.
- * Schema and placement are required; the remaining modules are optional.
+ * The always-read root. modules is a directory mapping each present module to its independently
+ * compact-Thrift serialized location. SCHEMA and PLACEMENT MUST be present; other kinds are
+ * optional. A new module kind is added to ModuleKind and slotted into the directory without
+ * changing this struct, and a reader ignores entries whose kind it does not understand.
  */
 struct ModularFooter {
   1: required i32 version,
@@ -255,10 +271,5 @@ struct ModularFooter {
   3: required i32 num_columns,
   4: required i64 num_rows,
   5: required list<i64> row_group_num_rows,
-  6: required ModuleLocation schema,
-  7: required ModuleLocation placement,
-  8: optional ModuleLocation row_group_statistics,
-  9: optional ModuleLocation offset_index,
-  10: optional ModuleLocation column_index,
-  11: optional ModuleLocation file_metadata
+  6: required list<ModuleDirectoryEntry> modules
 }
